@@ -483,13 +483,20 @@ if(VIDEO2X_BUILD_CLI)
             "${CMAKE_BINARY_DIR}/third_party/boost/libs/program_options/${CMAKE_BUILD_TYPE}"
         )
 
-        # Different build types have different DLL names
-        if(CMAKE_BUILD_TYPE STREQUAL Release)
-            set(boost_dll_path "${boost_base_path}/boost_program_options-vc143-mt-x64-1_86.dll")
-        else()
-            set(boost_dll_path "${boost_base_path}/boost_program_options-vc143-mt-gd-x64-1_86.dll")
-        endif()
-
-        install(FILES "${boost_dll_path}" DESTINATION "${CMAKE_INSTALL_BINDIR}")
+        # Match the DLL by pattern instead of spelling out its name. Boost encodes the MSVC toolset
+        # and the build variant into the file name - boost_program_options-vc143-mt-gd-x64-1_86.dll -
+        # so a hard-coded "vc143" breaks the moment the runner ships a newer Visual Studio. That is
+        # exactly what happened: windows-latest now has VS 18, Boost builds as vc180, and the install
+        # step fails with "file INSTALL cannot find ...-vc143-...dll" AFTER everything has already
+        # compiled and linked.
+        #
+        # install(DIRECTORY ... FILES_MATCHING) is evaluated at install time, not at configure time,
+        # which is what lets the glob see a DLL that does not exist yet when CMake runs.
+        install(
+            DIRECTORY "${boost_base_path}/"
+            DESTINATION "${CMAKE_INSTALL_BINDIR}"
+            FILES_MATCHING
+            PATTERN "boost_program_options-*.dll"
+        )
     endif()
 endif()
