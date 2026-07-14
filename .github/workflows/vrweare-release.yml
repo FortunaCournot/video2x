@@ -1,0 +1,216 @@
+# Release workflow of the VR we are fork. This is NOT upstream's release workflow - it replaces it on
+# this branch, because upstream's fires on every tag and then dies in its container job on secrets we
+# do not have.
+#
+# WHY THIS FORK PUBLISHES A BINARY AT ALL
+# Upstream Video2X segfaults on exit on every single run, successful ones included, so its exit code
+# carries no information. The fix is in this fork and has been offered upstream in
+# k4yt3x/video2x#1500. Until upstream merges it AND cuts a release, the VR we are installer downloads
+# the Windows binary from here instead.
+#
+# LICENCES - the package is a combined work and every part of it travels with obligations:
+#   * Video2X itself is AGPL-3.0. This is a MODIFIED version, so AGPL 5(a) requires a prominent
+#     notice of the change and its date: MODIFICATIONS.md, shipped inside the archive.
+#     The Corresponding Source is this repository at the tag the release is built from - same server,
+#     freely available, which is exactly what AGPL 6(d) allows.
+#   * The bundled FFmpeg DLLs come from GyanD's full_build-shared, which is a GPL build (it contains
+#     x264/x265). Redistributing them carries the same duty to offer source.
+#   * ncnn is BSD-3, Boost is BSL-1.0, spdlog is MIT.
+# The release notes below name each source explicitly. Upstream's own zip ships no licence text at
+# all; ours does.
+
+name: Release (VR we are fork)
+
+on:
+  push:
+    tags:
+      - "*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Build and publish the Windows binary
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Vulkan SDK
+        uses: humbletim/setup-vulkan-sdk@v1.2.1
+        with:
+          vulkan-query-version: 1.4.313.0
+          vulkan-components: Vulkan-Headers, Vulkan-Loader, Glslang, SPIRV-Tools, SPIRV-Headers
+          vulkan-use-cache: true
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          $ffmpegVersion = "7.1"
+          $ncnnVersion = "20241226"
+
+          git submodule update --init --recursive
+
+          curl -Lo ffmpeg-shared.zip "https://github.com/GyanD/codexffmpeg/releases/download/$ffmpegVersion/ffmpeg-$ffmpegVersion-full_build-shared.zip"
+          Expand-Archive -Path ffmpeg-shared.zip -DestinationPath third_party
+          Rename-Item -Path "third_party/ffmpeg-$ffmpegVersion-full_build-shared" -NewName ffmpeg-shared
+
+          curl -Lo ncnn-shared.zip "https://github.com/Tencent/ncnn/releases/download/$ncnnVersion/ncnn-$ncnnVersion-windows-vs2022-shared.zip"
+          Expand-Archive -Path ncnn-shared.zip -DestinationPath third_party
+          Rename-Item -Path "third_party/ncnn-$ncnnVersion-windows-vs2022-shared" -NewName ncnn-shared
+
+      - name: Build Video2X
+        shell: pwsh
+        run: |
+          cmake -S . -B build `
+            -DVIDEO2X_USE_EXTERNAL_NCNN=OFF -DVIDEO2X_USE_EXTERNAL_SPDLOG=OFF -DVIDEO2X_USE_EXTERNAL_BOOST=OFF `
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=build/video2x_install
+          cmake --build build --config Release --parallel --target install
+
+      - name: Package the binary
+        shell: pwsh
+        run: |
+          # The official release zip is FLAT: video2x.exe, every DLL and models/ sit at the archive
+          # root. CMake installs into bin/ and share/models instead, so flatten it back. This is not
+          # cosmetic - Video2X looks for its models next to the executable, and the VR we are
+          # installer looks for video2x.exe at the root of what it unpacks. Any other layout silently
+          # produces an installation that cannot find its models.
+          New-Item -ItemType Directory -Path build/pkg | Out-Null
+          Copy-Item build/video2x_install/bin/*   build/pkg -Recurse
+          Copy-Item build/video2x_install/share/models build/pkg/models -Recurse
+          # Mirror the dev files the official archive also carries, so this is a drop-in replacement.
+          Copy-Item build/video2x_install/include build/pkg/include -Recurse -ErrorAction SilentlyContinue
+          Copy-Item build/video2x_install/lib     build/pkg/lib     -Recurse -ErrorAction SilentlyContinue
+
+          # Upstream prunes the RIFE models when it packs a release: only v4.6, v4.25, v4.25-lite and
+          # v4.26 ship. "cmake --install" copies all fourteen, which TRIPLES the download - 619 MB
+          # instead of 197 MB - for models nobody uses. Match the official set, so this stays a
+          # drop-in replacement in size as well as in layout.
+          $keepRife = @("rife-v4.6", "rife-v4.25", "rife-v4.25-lite", "rife-v4.26")
+          Get-ChildItem build/pkg/models/rife -Directory |
+              Where-Object { $keepRife -notcontains $_.Name } |
+              ForEach-Object { Write-Host "  dropping model $($_.Name)"; Remove-Item $_.FullName -Recurse -Force }
+
+          Copy-Item MODIFICATIONS.md build/pkg/MODIFICATIONS.md
+          New-Item -ItemType Directory -Path build/pkg/licenses | Out-Null
+
+      - name: Collect the licences
+        shell: pwsh
+        run: |
+          # Upstream's zip ships no licence text at all. Ours does. Kept deliberately simple: copy
+          # whatever each component provides, and write ONE generated summary that names the rest.
+          # Same remedy the VR we are installer already applies to ExifTool, which ships no licence
+          # file either.
+          $L = "build/pkg/licenses"
+          Copy-Item LICENSE "$L/LICENSE_Video2X_AGPL-3.0.txt"
+          Copy-Item NOTICE  "$L/NOTICE_Video2X.txt" -ErrorAction SilentlyContinue
+
+          foreach ($c in @("ffmpeg-shared", "ncnn", "boost", "spdlog",
+                           "librife_ncnn_vulkan", "librealesrgan_ncnn_vulkan", "librealcugan_ncnn_vulkan")) {
+              Get-ChildItem "third_party/$c" -Filter "LICENSE*" -File -ErrorAction SilentlyContinue |
+                  Select-Object -First 1 |
+                  ForEach-Object { Copy-Item $_.FullName "$L/LICENSE_$c.txt"; Write-Host "copied LICENSE_$c.txt" }
+          }
+
+          @"
+          Licences of everything in this archive
+          ======================================
+          Generated at build time. Where a component ships its own licence file it is copied verbatim
+          into this folder; this summary covers all of them, including any that ship none.
+
+          Video2X (MODIFIED - see MODIFICATIONS.md)   AGPL-3.0   https://github.com/k4yt3x/video2x
+            Source of this binary: https://github.com/FortunaCournot/video2x  tag ${{ github.ref_name }}
+            The source is also attached to that release as video2x-source.zip.
+
+          FFmpeg DLLs                                 GPL        https://github.com/GyanD/codexffmpeg/releases/tag/7.1
+            A GPL build - it links x264 and x265.
+          ncnn                                        BSD-3      https://github.com/Tencent/ncnn
+          Boost                                       BSL-1.0    https://www.boost.org/LICENSE_1_0.txt
+          spdlog                                      MIT        https://github.com/gabime/spdlog
+          rife-ncnn-vulkan                            MIT        https://github.com/nihui/rife-ncnn-vulkan
+          realesrgan-ncnn-vulkan                      MIT        https://github.com/nihui/realesrgan-ncnn-vulkan
+          realcugan-ncnn-vulkan                       MIT        https://github.com/nihui/realcugan-ncnn-vulkan
+
+          Models in models/
+            RIFE          MIT     https://github.com/hzwer/Practical-RIFE   (granted for the model files in its README)
+            Real-ESRGAN   BSD-3   https://github.com/xinntao/Real-ESRGAN
+          "@ | Out-File -Encoding utf8 "$L/LICENSES.txt"
+
+          Get-ChildItem $L | ForEach-Object { Write-Host "  $($_.Name)" }
+
+      - name: Package the source
+        shell: pwsh
+        run: |
+          # AGPL section 6 / GPL section 3: the object code must be accompanied by the Corresponding
+          # Source. Shipping it as a release asset next to the binary is the least ambiguous way to do
+          # that - no "written offer", no expiry, nothing for anyone to chase.
+          #
+          # The checkout is recursive, so this tree already contains every submodule. Excluded are
+          # only .git metadata, the build output, and the two PREBUILT dependencies that are binaries
+          # rather than source - their source is named in the release notes and in licenses/.
+          $src = "build/src/video2x-${{ github.ref_name }}"
+          New-Item -ItemType Directory -Path $src -Force | Out-Null
+          $exclude = @("build", ".git")
+          Get-ChildItem -Force . | Where-Object { $exclude -notcontains $_.Name } | ForEach-Object {
+              Copy-Item $_.FullName -Destination $src -Recurse -Force
+          }
+          Remove-Item -Recurse -Force "$src/third_party/ffmpeg-shared" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "$src/third_party/ncnn-shared"   -ErrorAction SilentlyContinue
+          Get-ChildItem -Path $src -Recurse -Force -Directory -Filter ".git" | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+
+          Compress-Archive -Path $src -DestinationPath build/video2x-source.zip -CompressionLevel Optimal
+          $size = [math]::Round((Get-Item build/video2x-source.zip).Length / 1MB, 1)
+          Write-Host "source archive: $size MB"
+          if ($size -gt 1900) { throw "source archive is $size MB - too large for a GitHub release asset" }
+
+      - name: Checksums
+        shell: pwsh
+        run: |
+          Compress-Archive -Path build/pkg/* -DestinationPath build/video2x-windows-amd64.zip
+          foreach ($f in @("build/video2x-windows-amd64.zip", "build/video2x-source.zip")) {
+              $hash = (Get-FileHash $f -Algorithm SHA256).Hash.ToLower()
+              $hash | Out-File -Encoding ascii -NoNewline "$f.sha256"
+              Write-Host "SHA256  $hash  $(Split-Path $f -Leaf)"
+          }
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          name: ${{ github.ref_name }}
+          files: |
+            build/video2x-windows-amd64.zip
+            build/video2x-windows-amd64.zip.sha256
+            build/video2x-source.zip
+            build/video2x-source.zip.sha256
+          body: |
+            **Modified build of Video2X. Not an official release.**
+
+            Built from this fork, which fixes the segmentation fault that upstream Video2X produces on
+            every run - successful runs included - so that the exit code becomes meaningful. See
+            [MODIFICATIONS.md](https://github.com/FortunaCournot/video2x/blob/${{ github.ref_name }}/MODIFICATIONS.md).
+
+            Offered back upstream: https://github.com/k4yt3x/video2x/pull/1500
+            Once upstream releases the fix, this fork becomes unnecessary.
+
+            ### Assets
+
+            | | |
+            |---|---|
+            | `video2x-windows-amd64.zip` | the binary, plus `licenses/` and `MODIFICATIONS.md` |
+            | `video2x-source.zip` | the complete Corresponding Source, submodules included |
+
+            ### Licences
+
+            The binary is a combined work. AGPL-3.0 section 6 and GPL section 3 want the source
+            alongside the object code — it is attached above, in the same place, at no charge.
+
+            | Component | Licence | Source |
+            |---|---|---|
+            | Video2X (modified) | AGPL-3.0 | this repository, tag `${{ github.ref_name }}` |
+            | FFmpeg DLLs | GPL (GyanD `full_build-shared`, contains x264/x265) | https://github.com/GyanD/codexffmpeg/releases/tag/7.1 |
+            | ncnn | BSD-3-Clause | https://github.com/Tencent/ncnn/releases/tag/20241226 |
+            | Boost, spdlog, the ncnn-vulkan wrappers | BSL-1.0 / MIT | submodules of this repository |
